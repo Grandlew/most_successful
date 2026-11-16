@@ -81,6 +81,10 @@ class RevisionTests(unittest.TestCase):
         values = {"square": 4, "x": 2}
         self.assertEqual(evaluate_revision(task), Revision(values, values, frozenset()))
 
+    def test_rejects_empty_outputs(self):
+        with self.assertRaisesRegex(ValueError, "at least one requested output"):
+            replace(cancellation_task(), outputs=())
+
     def test_invalid_graphs(self):
         task = replace(cancellation_task(), outputs=("a",))
         cases = (

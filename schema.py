@@ -62,6 +62,8 @@ class RevisionTask:
         if type(self.edit.value) is not int:
             raise ValueError("edit value must be an integer")
 
+        if not self.outputs:
+            raise ValueError("a revision task requires at least one requested output")
         if len(set(self.outputs)) != len(self.outputs):
             raise ValueError("duplicate requested output")
         for output in self.outputs:
