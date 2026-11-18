@@ -1,7 +1,7 @@
 """Generate the Day 2 audit JSONL with `python generate.py --seed 42 --output PATH`.
 
 Inputs and replacement values are sampled from [-9, 9] excluding zero.
-Every computed node stays in [-171, 171]. The longest chain is bounded by
+Every Day 2 computed node stays in [-171, 171]. Its longest chain is bounded by
 (9 + 9) * 9 + 9, and the diamond joins two branches bounded by 18 each.
 A replacement always differs from the original input. Each case gets at most
 100 attempts to find a task that has not already been emitted.
@@ -13,6 +13,7 @@ import json
 import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Iterator
 
 from schema import DerivedNode, InputEdit, InputNode, RevisionTask
 from verify import evaluate_revision
@@ -61,6 +62,33 @@ _TEMPLATES = {
     "three_or_more_changed": AuditTemplate(_INPUTS, _CHAIN, ("a", "b", "c")),
 }
 
+_DIAMOND = _TEMPLATES["diamond"].derived
+_DEEP_CHAIN = (
+    *_CHAIN,
+    DerivedNode("d", "+", "c", "m"),
+    DerivedNode("e", "-", "d", "x"),
+    DerivedNode("f", "+", "e", "k"),
+)
+# Each entry has two output selections over the same wiring.
+_EXPERIMENT_CATALOG = (
+    AuditTemplate(_INPUTS, _CHAIN, ("a",)),
+    AuditTemplate(_INPUTS, _CHAIN, ("c",)),
+    AuditTemplate(_INPUTS, _DIAMOND, ("total",)),
+    AuditTemplate(_INPUTS, _DIAMOND, ("a", "total")),
+    AuditTemplate((*_INPUTS, "unused"), _DISCONNECTED, ("b",)),
+    _TEMPLATES["mixed_changed_stable"],
+    AuditTemplate(_INPUTS, (*_CHAIN[:2], DerivedNode("c", "-", "a", "k")), ("b",)),
+    AuditTemplate(_INPUTS, (*_CHAIN[:2], DerivedNode("c", "-", "a", "k")), ("b", "c")),
+    AuditTemplate(_INPUTS, (*_CHAIN[:2], DerivedNode("c", "+", "b", "b")), ("b",)),
+    AuditTemplate(_INPUTS, (*_CHAIN[:2], DerivedNode("c", "+", "b", "b")), ("c",)),
+    AuditTemplate(_INPUTS, (*_CHAIN[:2], DerivedNode("c", "-", "b", "a")), ("c",)),
+    AuditTemplate(_INPUTS, (*_CHAIN[:2], DerivedNode("c", "-", "b", "a")), ("b", "c")),
+    AuditTemplate(_INPUTS, _DEEP_CHAIN, ("d",)),
+    AuditTemplate(_INPUTS, _DEEP_CHAIN, ("f",)),
+    AuditTemplate(_INPUTS, (*_DEEP_CHAIN[:4], DerivedNode("e", "-", "d", "b")), ("d",)),
+    AuditTemplate(_INPUTS, (*_DEEP_CHAIN[:4], DerivedNode("e", "-", "d", "b")), ("e",)),
+)
+
 
 def _sample_task(template: AuditTemplate, rng: random.Random) -> RevisionTask:
     values = {name: rng.choice(SAMPLE_VALUES) for name in template.inputs}
@@ -101,12 +129,12 @@ def graph_family_id(task: RevisionTask) -> str:
     return _digest(_json(graph))
 
 
-def generate_cases(seed: int) -> list[dict[str, object]]:
-    """Generate five distinct tasks per audit category, labeled by the Day 1 oracle."""
+def _labeled_cases(
+    seed: int, templates: tuple[tuple[str, AuditTemplate], ...]
+) -> Iterator[tuple[str, RevisionTask, dict[str, object]]]:
     rng = random.Random(seed)
     seen: set[str] = set()
-    records: list[dict[str, object]] = []
-    for category, template in _TEMPLATES.items():
+    for category, template in templates:
         for index in range(1, CASES_PER_CATEGORY + 1):
             for _ in range(MAX_ATTEMPTS):
                 task = _sample_task(template, rng)
@@ -122,16 +150,32 @@ def generate_cases(seed: int) -> list[dict[str, object]]:
 
             seen.add(key)
             revision = evaluate_revision(task)
-            records.append({
+            yield category, task, {
                 "case_id": _digest(key),
                 "graph_family_id": graph_family_id(task),
-                "audit_category": category,
                 "task": task_record,
                 "old": revision.old,
                 "new": revision.new,
                 "changed": sorted(revision.changed),
-            })
-    return records
+            }
+
+
+def generate_cases(seed: int) -> list[dict[str, object]]:
+    """Generate five distinct tasks per audit category, labeled by the Day 1 oracle."""
+    return [
+        {**record, "audit_category": category}
+        for category, _, record in _labeled_cases(seed, tuple(_TEMPLATES.items()))
+    ]
+
+
+def generate_experiment_cases(seed: int) -> Iterator[tuple[RevisionTask, dict[str, object]]]:
+    """Sample labeled cases from the experiment catalog independently of the audit."""
+    templates = tuple(
+        (f"experiment template {index}", template)
+        for index, template in enumerate(_EXPERIMENT_CATALOG, start=1)
+    )
+    for _, task, record in _labeled_cases(seed, templates):
+        yield task, record
 
 
 def main() -> None:
