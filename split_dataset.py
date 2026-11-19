@@ -21,6 +21,12 @@ TRAIN_DEPTH_LIMIT = 3
 SPLITS = ("train", "development", "topology_holdout", "depth_extrapolation")
 
 
+def manifest_checksum(payload: dict[str, object]) -> str:
+    """Hash the canonical manifest payload before adding its checksum field."""
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _node_depths(task: RevisionTask) -> dict[str, int]:
     depths = dict.fromkeys((node.name for node in task.inputs), 0)
     for node in task.evaluation_order:
@@ -141,8 +147,7 @@ def build_manifest(seed: int) -> dict[str, object]:
         for name, cases in splits.items()
     }
     payload = {"version": MANIFEST_VERSION, "seed": seed, "cases": entries, "summary": summary}
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return {**payload, "sha256": hashlib.sha256(encoded).hexdigest()}
+    return {**payload, "sha256": manifest_checksum(payload)}
 
 
 def main() -> None:
