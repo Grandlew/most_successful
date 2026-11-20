@@ -16,11 +16,14 @@ DEFAULT_MANIFEST = Path(__file__).resolve().parent / "data" / "day03_manifest.js
 
 
 @dataclass(frozen=True)
-class DevelopmentCase:
+class RevisionCase:
     case_id: str
     shape_group: str
     depth: int
     task: RevisionTask
+
+
+DevelopmentCase = RevisionCase
 
 
 def unique_fields(pairs):
@@ -34,6 +37,13 @@ def unique_fields(pairs):
 
 def load_development(path: Path) -> tuple[str, list[DevelopmentCase]]:
     """Verify the manifest and join only its development rows to regenerated tasks."""
+    return load_cases(path, "development")
+
+
+def load_cases(path: Path, split: str) -> tuple[str, list[RevisionCase]]:
+    """Verify and join a train or development split from the frozen manifest."""
+    if split not in ("train", "development"):
+        raise ValueError(f"unsupported split: {split}")
     manifest = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_fields)
     if not isinstance(manifest, dict):
         raise ValueError("manifest must be a JSON object")
@@ -45,12 +55,12 @@ def load_development(path: Path) -> tuple[str, list[DevelopmentCase]]:
 
     rows = manifest["cases"]
     counts = Counter(row["case_id"] for row in rows)
-    selected = {row["case_id"]: row for row in rows if row["split"] == "development"}
+    selected = {row["case_id"]: row for row in rows if row["split"] == split}
     if not selected:
-        raise ValueError("manifest has no development cases")
+        raise ValueError(f"manifest has no {split} cases")
     for case_id in selected:
         if counts[case_id] != 1:
-            raise ValueError(f"duplicate development case ID in manifest: {case_id}")
+            raise ValueError(f"duplicate {split} case ID in manifest: {case_id}")
 
     joined = {}
     for task, record in generate_experiment_cases(manifest["seed"]):
@@ -58,14 +68,14 @@ def load_development(path: Path) -> tuple[str, list[DevelopmentCase]]:
         if case_id not in selected:
             continue
         if case_id in joined:
-            raise ValueError(f"duplicate regenerated development case ID: {case_id}")
+            raise ValueError(f"duplicate regenerated {split} case ID: {case_id}")
         row = selected[case_id]
         if row["shape_group"] != shape_group(task) or row["depth"] != output_depth(task):
             raise ValueError(f"regenerated task disagrees with manifest metadata: {case_id}")
-        joined[case_id] = DevelopmentCase(case_id, row["shape_group"], row["depth"], task)
+        joined[case_id] = RevisionCase(case_id, row["shape_group"], row["depth"], task)
     missing = selected.keys() - joined.keys()
     if missing:
-        raise ValueError(f"missing regenerated development case IDs: {', '.join(sorted(missing))}")
+        raise ValueError(f"missing regenerated {split} case IDs: {', '.join(sorted(missing))}")
     return checksum, [joined[case_id] for case_id in selected]
 
 
