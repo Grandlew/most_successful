@@ -4,12 +4,16 @@ import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import baseline_qwen
 from evaluate import evaluate, read_predictions
 from render_prompts import DEFAULT_MANIFEST, load_development, render_prompt
-from train_sft import IGNORE_INDEX, collate_examples, encode_example, select_tiny_cases
+from train_sft import (
+    IGNORE_INDEX, _make_optimizer, _prepare_model, _weighted_microbatches,
+    collate_examples, encode_example, select_tiny_cases,
+)
 from verify import evaluate_revision
 
 
@@ -29,6 +33,50 @@ class ToyTokenizer:
 
 
 class SFTTests(unittest.TestCase):
+    def test_lora_mode_wraps_the_original_model_and_unknown_modes_are_rejected(self):
+        peft = SimpleNamespace(LoraConfig=Mock(return_value="config"),
+                               get_peft_model=Mock(return_value="wrapped"))
+        with (patch.dict("sys.modules", {"peft": peft}),
+              patch("train_sft.load_qwen", return_value=("base", "tokenizer")) as load):
+            self.assertEqual(_prepare_model("lora", "cpu"), ("wrapped", "tokenizer"))
+            load.assert_called_once_with("cpu")
+            peft.get_peft_model.assert_called_once_with("base", "config")
+            with self.assertRaisesRegex(ValueError, "unknown training mode"):
+                _prepare_model("unknown", "cpu")
+
+    @unittest.skipUnless(HAS_MODEL_DEPS, "CPU optimizer test requires torch")
+    def test_full_mode_optimizes_every_base_parameter_without_wrapping(self):
+        import torch
+
+        base = torch.nn.Sequential(torch.nn.Linear(2, 3), torch.nn.Linear(3, 1))
+        base.requires_grad_(False)
+        with patch("train_sft.load_qwen", return_value=(base, "tokenizer")) as load:
+            model, tokenizer = _prepare_model("full", "cpu")
+            load.assert_called_once_with("cpu", fp32=True)
+            self.assertIs(model, base)
+            self.assertEqual(tokenizer, "tokenizer")
+            self.assertFalse(hasattr(model, "peft_config"))
+            optimizer, trainable = _make_optimizer(model, 0.01)
+            self.assertEqual({id(p) for p in optimizer.param_groups[0]["params"]},
+                             {id(p) for p in base.parameters()})
+            self.assertTrue(all(p.requires_grad and p.dtype == torch.float32 for p in trainable))
+            before = base[-1].bias.detach().clone()
+            base(torch.ones(1, 2)).sum().backward()
+            optimizer.step()
+            self.assertFalse(torch.equal(before, base[-1].bias))
+
+            base.peft_config = {"adapter": "present"}
+            with self.assertRaisesRegex(RuntimeError, "without adapters"):
+                _prepare_model("full", "cpu")
+
+    def test_microbatch_means_are_weighted_by_supervised_tokens_including_eos(self):
+        tokenizer = ToyTokenizer()
+        short = encode_example(tokenizer, "Long prompt.", '{"a":1}')
+        long = encode_example(tokenizer, "Edit.", '{"a":-42}')
+        self.assertEqual(_weighted_microbatches([short, long], 1),
+                         [([short], 8 / 18), ([long], 10 / 18)])
+        self.assertEqual(_weighted_microbatches([short, long], 2), [([short, long], 1)])
+
     def test_four_ids_are_deterministic_and_train_only(self):
         checksum, cases = select_tiny_cases(DEFAULT_MANIFEST)
         manifest = json.loads(DEFAULT_MANIFEST.read_text(encoding="utf-8"))

@@ -12,14 +12,14 @@ MODEL_REVISION = "da87bfb608c14b7cf20ba1ce41287e8de496c0cd"
 MAX_NEW_TOKENS = 64
 
 
-def load_qwen(device):
+def load_qwen(device, *, fp32=False):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, revision=MODEL_REVISION, use_fast=True)
-    dtype = torch.float16 if device == "cuda" else torch.float32
+    dtype = torch.float16 if device == "cuda" and not fp32 else torch.float32
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID, revision=MODEL_REVISION, dtype=dtype, attn_implementation="sdpa",
     ).to(device)
