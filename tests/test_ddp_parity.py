@@ -1,22 +1,48 @@
+import io
 import importlib.util
 import unittest
+from contextlib import redirect_stderr
+from pathlib import Path
 
 from ddp_parity import (
     TRACE_SCALARS, TRACE_TENSORS, TOLERANCES, ParameterTrace, _compare_trace, _loss_report,
-    _prepare_batches, _require_profile_gate, _tensor_report, ddp_loss_weight, global_batches,
+    _parse_args, _prepare_batches, _require_profile_gate, _tensor_report, ddp_loss_weight, global_batches,
 )
 from train_sft import TrainingExample
 
 
 class BatchTests(unittest.TestCase):
     def test_failed_or_unmatched_parity_report_blocks_profiling(self):
-        settings = {"precision": "fp16", "tolerances": TOLERANCES}
-        good = {"world_size": 2, "passed": True, "settings": settings}
+        settings = {"precision": "FP32 weights and compute, no loss scaling", "initial_loss_scale": 1,
+                    "tolerances": TOLERANCES, "parity_global_batches": [["a", "b", "c", "d"]],
+                    "revision": "model-revision", "learning_rate": 2e-5}
+        good = {"phase": "parity", "world_size": 2, "passed": True, "settings": settings}
         _require_profile_gate(good, settings)
-        for invalid in ({**good, "passed": False}, {**good, "world_size": 1},
-                        {**good, "settings": {**settings, "precision": "fp32"}}):
+        for invalid in ({**good, "passed": False}, {**good, "world_size": 1}, {**good, "phase": "profile"},
+                        {**good, "settings": {**settings, "parity_global_batches": [["b", "a", "c", "d"]]}},
+                        {**good, "settings": {**settings, "revision": "other-model"}},
+                        {**good, "settings": {**settings, "learning_rate": 1e-5}}):
             with self.subTest(report=invalid), self.assertRaisesRegex(ValueError, "passing two-GPU parity"):
                 _require_profile_gate(invalid, settings)
+        fp16 = {**settings, "precision": "FP32 weights, FP16 autocast and dynamic loss scaling",
+                "initial_loss_scale": 1024}
+        with self.assertRaisesRegex(ValueError, "passing two-GPU parity"):
+            _require_profile_gate(good, fp16)
+
+    def test_fp32_profile_cli_accepts_parity_report_and_disallows_tracing(self):
+        command = ["--phase", "profile", "--precision", "fp32", "--output", "profile.json"]
+        args = _parse_args(command + ["--parity-report", "parity.json"])
+        self.assertEqual((args.phase, args.precision), ("profile", "fp32"))
+        self.assertEqual(args.parity_report, Path("parity.json"))
+        self.assertIsNone(args.trace_dir)
+        for flags, expected in (([], "profile requires --parity-report"),
+                                (["--parity-report", "parity.json", "--trace-dir", "trace"],
+                                 "parameter trace is only available in the parity phase")):
+            with self.subTest(flags=flags), redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit) as error:
+                    _parse_args(command + flags)
+                self.assertEqual(error.exception.code, 2)
+                self.assertIn(expected, stderr.getvalue())
 
     @unittest.skipUnless(importlib.util.find_spec("torch"), "parameter trace requires torch")
     def test_trace_uses_previous_weight_for_update_delta_and_initial_for_cumulative(self):

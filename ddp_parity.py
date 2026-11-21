@@ -368,6 +368,7 @@ def _profile(args, update, metadata, rank, world, device):
         supervised = sum(row["global_supervised_tokens"] for row in timed)
         _write(args.output, {**metadata, "passed": passed, "warmup_updates": WARMUP_UPDATES,
                              "timed_updates": TIMED_UPDATES, "elapsed_seconds": seconds,
+                             "timed_gpu_seconds": world * seconds,
                              "global_non_padding_tokens": nonpadding, "global_supervised_tokens": supervised,
                              "global_non_padding_tokens_per_second": nonpadding / seconds,
                              "global_supervised_tokens_per_second": supervised / seconds,
@@ -379,7 +380,8 @@ def _profile(args, update, metadata, rank, world, device):
 
 
 def _require_profile_gate(gate, settings):
-    if gate["world_size"] != 2 or not gate["passed"] or gate["settings"] != settings:
+    if (gate.get("phase") != "parity" or gate.get("world_size") != 2
+            or gate.get("passed") is not True or gate.get("settings") != settings):
         raise ValueError("profile requires a passing two-GPU parity report for the same settings")
 
 
@@ -429,7 +431,8 @@ def run(args):
         if not fp16:
             settings.update(precision="FP32 weights and compute, no loss scaling", initial_loss_scale=1)
         if args.phase == "profile":
-            _require_profile_gate(_read(args.parity_report), settings)
+            gate_bytes = args.parity_report.read_bytes()
+            _require_profile_gate(json.loads(gate_bytes), settings)
         count = PARITY_UPDATES if args.phase == "parity" else WARMUP_UPDATES + TIMED_UPDATES
         batches = [_prepare_batches(order, examples, world)
                    for order in global_batches(ids, count)]
@@ -440,6 +443,8 @@ def run(args):
                          supervised_count(example.labels)) for key, example in examples.items()}
         metadata = {"phase": args.phase, "world_size": world, "gpu": torch.cuda.get_device_name(device),
                     "torch_version": str(torch.__version__), "settings": settings, "batches": batches}
+        if args.phase == "profile":
+            metadata["parity_report_sha256"] = hashlib.sha256(gate_bytes).hexdigest()
         if rank == 0:
             print(json.dumps({"event": "start", **metadata}), flush=True)
 
@@ -458,7 +463,7 @@ def run(args):
             dist.destroy_process_group()
 
 
-def main():
+def _parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--phase", choices=("parity", "profile"), required=True)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
@@ -467,15 +472,20 @@ def main():
     parser.add_argument("--parity-report", type=Path)
     parser.add_argument("--trace-dir", type=Path, help=f"capture both updates for {TRACE_PARAMETER}")
     parser.add_argument("--precision", choices=("fp16", "fp32"), default="fp16")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.phase == "parity" and args.reference_dir is None:
         parser.error("parity requires --reference-dir")
     if args.phase == "profile" and args.parity_report is None:
         parser.error("profile requires --parity-report")
     if args.phase == "profile" and args.trace_dir is not None:
         parser.error("the parameter trace is only available in the parity phase")
-    if args.precision == "fp32" and (args.phase != "parity" or args.trace_dir is None):
-        parser.error("FP32 is only available as an opt-in parity diagnostic with --trace-dir")
+    if args.phase == "parity" and args.precision == "fp32" and args.trace_dir is None:
+        parser.error("FP32 parity requires --trace-dir")
+    return args
+
+
+def main():
+    args = _parse_args()
     if not run(args):
         parser.exit(1, "Day 6 check failed; see the JSON report\n")
 
