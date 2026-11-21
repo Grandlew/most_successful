@@ -31,6 +31,7 @@ WARMUP_UPDATES = 2
 TIMED_UPDATES = 3
 INITIAL_SCALE = 1024
 MAX_GRAD_NORM = 1.0
+TRACE_PARAMETER = "model.layers.11.self_attn.k_norm.weight"
 TOLERANCES = {
     "loss": {"atol": 0.02, "rtol": 0.01},
     "first_gradient": {"atol": 1e-6, "rtol": 0.025},
@@ -69,7 +70,8 @@ def _prepare_batches(case_ids, examples, world):
     }
 
 
-def _train_update(model, optimizer, trainable, scaler, microbatches, world, gradient_hook=None):
+def _train_update(model, optimizer, trainable, scaler, microbatches, world, gradient_hook=None,
+                  *, fp16=True, trace=None):
     import torch
     import torch.distributed as dist
 
@@ -83,23 +85,31 @@ def _train_update(model, optimizer, trainable, scaler, microbatches, world, grad
     for index, (batch, count) in enumerate(microbatches):
         sync = model.no_sync() if world == 2 and index < len(microbatches) - 1 else nullcontext()
         with sync:
-            with torch.autocast("cuda", dtype=torch.float16):
+            with torch.autocast("cuda", dtype=torch.float16, enabled=fp16):
                 loss = model(**batch, use_cache=False).loss
             local_sum += loss.detach().double() * count
             scaler.scale(loss * ddp_loss_weight(count, total, world)).backward()
     scaler.unscale_(optimizer)
     if gradient_hook is not None:
         gradient_hook()
-    torch.nn.utils.clip_grad_norm_(trainable, MAX_GRAD_NORM)
+    if trace is not None:
+        trace.pre_clip()
+    norm = torch.nn.utils.clip_grad_norm_(trainable, MAX_GRAD_NORM)
     before = scaler.get_scale()
+    if trace is not None:
+        trace.post_clip(norm, before)
     scaler.step(optimizer)
     scaler.update()
     optimizer.zero_grad(set_to_none=True)
     if world == 2:
         dist.all_reduce(local_sum)
     loss_value = local_sum.item() / total
+    after = scaler.get_scale()
+    skipped = after < before
+    if trace is not None:
+        trace.post_step(optimizer, after, skipped)
     return {"token_mean_loss": loss_value if math.isfinite(loss_value) else None,
-            "skipped": scaler.get_scale() < before}
+            "skipped": skipped}
 
 
 def _cpu_tensors(model, gradients=False):
@@ -115,7 +125,7 @@ def _initial_hash(tensors):
     return digest.hexdigest()
 
 
-def _errors(actual, reference, limit):
+def _distances(actual, reference):
     import torch
 
     difference = actual - reference
@@ -123,12 +133,93 @@ def _errors(actual, reference, limit):
     rms = torch.linalg.vector_norm(difference).item() / math.sqrt(difference.numel())
     scale = torch.linalg.vector_norm(reference).item() / math.sqrt(reference.numel())
     if not all(map(math.isfinite, (absolute, rms, scale))):
-        return {"max_abs": None, "rms_abs": None, "relative_l2": None,
-                "tolerance_ratio": None, "passed": False}
+        return {"max_abs": None, "rms_abs": None, "reference_rms": None, "relative_l2": None}
     return {"max_abs": absolute, "rms_abs": rms,
-            "relative_l2": rms / scale if scale else (0.0 if not rms else None),
-            "tolerance_ratio": rms / (limit["atol"] + limit["rtol"] * scale),
-            "passed": rms <= limit["atol"] + limit["rtol"] * scale}
+            "reference_rms": scale, "relative_l2": rms / scale if scale else (0.0 if not rms else None)}
+
+
+def _errors(actual, reference, limit):
+    distances = _distances(actual, reference)
+    scale = distances["reference_rms"]
+    bound = limit["atol"] + limit["rtol"] * scale if scale is not None else None
+    rms = distances["rms_abs"]
+    return {**distances, "bound_rms": bound, "tolerance_ratio": rms / bound if bound is not None else None,
+            "passed": bound is not None and rms <= bound}
+
+
+def _parameter_deltas(current, previous, initial):
+    return {"update_delta": current - previous, "cumulative_delta": current - initial}
+
+
+class ParameterTrace:
+    """Capture one small base tensor on rank zero without changing the optimizer."""
+
+    def __init__(self, parameter, initial):
+        self.parameter = parameter
+        self.initial = initial
+        self.previous = initial
+        self.steps = []
+
+    def pre_clip(self):
+        self.steps.append({"gradient_pre_clip": self.parameter.grad.detach().to("cpu", copy=True)})
+
+    def post_clip(self, norm, scale):
+        step = self.steps[-1]
+        step.update(
+            gradient_post_clip=self.parameter.grad.detach().to("cpu", copy=True),
+            global_pre_clip_norm=norm.item(),
+            clip_factor=(MAX_GRAD_NORM / (norm + 1e-6)).clamp(max=1.0).item(),
+            scaler_before=scale,
+        )
+
+    def post_step(self, optimizer, scale, skipped):
+        step = self.steps[-1]
+        state = optimizer.state.get(self.parameter, {})
+        current = self.parameter.detach().to("cpu", copy=True)
+        step.update(_parameter_deltas(current, self.previous, self.initial))
+        for key in ("exp_avg", "exp_avg_sq"):
+            value = state.get(key)
+            step[key] = value.detach().to("cpu", copy=True) if value is not None else None
+        step.update(scaler_after=scale, skipped=skipped)
+        self.previous = current
+
+
+TRACE_TENSORS = ("gradient_pre_clip", "gradient_post_clip", "exp_avg", "exp_avg_sq",
+                 "update_delta", "cumulative_delta")
+TRACE_SCALARS = ("global_pre_clip_norm", "clip_factor", "scaler_before", "scaler_after")
+
+
+def _compare_trace(actual, reference):
+    rows = []
+    for step, (a, b) in enumerate(zip(actual, reference, strict=True), 1):
+        tensors = {key: _distances(a[key], b[key]) if a[key] is not None and b[key] is not None else None
+                   for key in TRACE_TENSORS}
+        cumulative = _errors(a["cumulative_delta"], b["cumulative_delta"], TOLERANCES["parameter_delta"])
+        scalars = {key: {"one_gpu": b[key], "two_gpu": a[key], "absolute_error": abs(a[key] - b[key])}
+                   if math.isfinite(a[key]) and math.isfinite(b[key]) else None for key in TRACE_SCALARS}
+        rows.append({"step": step, "tensors": tensors, "scalars": scalars,
+                     "cumulative_delta_vs_original_bound": cumulative,
+                     "skipped": {"one_gpu": b["skipped"], "two_gpu": a["skipped"]}})
+
+    first = next((row["step"] for row in rows
+                  if row["cumulative_delta_vs_original_bound"]["tolerance_ratio"] is not None
+                  and row["cumulative_delta_vs_original_bound"]["tolerance_ratio"] > 1), None)
+    final_difference = actual[-1]["cumulative_delta"] - reference[-1]["cumulative_delta"]
+    index = int(final_difference.abs().argmax())
+
+    def coordinate(step, key):
+        value = step[key]
+        if value is not None:
+            scalar = value.flatten()[index].item()
+            return scalar if math.isfinite(scalar) else None
+        return None
+
+    return {"parameter": TRACE_PARAMETER, "steps": rows, "first_step_over_bound": first,
+            "worst_final_coordinate": {
+                "flat_index": index,
+                "steps": [{key: {"one_gpu": coordinate(b, key), "two_gpu": coordinate(a, key)}
+                           for key in TRACE_TENSORS} for a, b in zip(actual, reference, strict=True)],
+            }}
 
 
 def _tensor_report(actual, reference, limit):
@@ -184,6 +275,10 @@ def _parity(args, model, update, metadata, rank, world):
     if reference and reference["settings"] != metadata["settings"]:
         raise ValueError("one- and two-GPU parity settings differ")
     comparisons = {}
+    trace = None
+    if rank == 0 and args.trace_dir is not None:
+        parameter = model.get_parameter(TRACE_PARAMETER)
+        trace = ParameterTrace(parameter, initial[TRACE_PARAMETER])
 
     def capture(kind, values):
         path = reference_dir / f"{kind}.pt"
@@ -199,7 +294,7 @@ def _parity(args, model, update, metadata, rank, world):
         hook = None
         if step == 0 and rank == 0:
             hook = lambda: capture("first_gradient", _cpu_tensors(model, gradients=True))
-        result = update(step, hook)
+        result = update(step, hook, trace)
         losses.append(result["token_mean_loss"])
         skipped.append(result["skipped_by_rank"])
     if rank != 0:
@@ -220,6 +315,20 @@ def _parity(args, model, update, metadata, rank, world):
               "token_mean_losses": losses, "skipped_by_update_and_rank": skipped,
               "skipped_updates_per_rank": [sum(row[index] for row in skipped) for index in range(world)],
               "comparisons": comparisons}
+    if trace is not None:
+        args.trace_dir.mkdir(parents=True, exist_ok=True)
+        trace_name = f"{args.precision}_trace"
+        torch.save({"settings": metadata["settings"], "initial_state_sha256": before,
+                    "steps": trace.steps}, args.trace_dir / f"{trace_name}_{world}gpu.pt")
+        if world == 2:
+            expected_trace = torch.load(args.trace_dir / f"{trace_name}_1gpu.pt", weights_only=True)
+            if (expected_trace["settings"] != reference["settings"]
+                    or expected_trace["initial_state_sha256"] != reference["initial_state_sha256"]):
+                raise ValueError("diagnostic trace does not match the run's one-GPU reference")
+            diagnostic = _compare_trace(trace.steps, expected_trace["steps"])
+            _write(args.trace_dir / f"{trace_name}_comparison.json", {
+                "settings": metadata["settings"], "parity_passed": passed, **diagnostic,
+            })
     if world == 1:
         _write(reference_dir / "reference.json", report)
     _write(args.output, report)
@@ -269,6 +378,11 @@ def _profile(args, update, metadata, rank, world, device):
     return passed
 
 
+def _require_profile_gate(gate, settings):
+    if gate["world_size"] != 2 or not gate["passed"] or gate["settings"] != settings:
+        raise ValueError("profile requires a passing two-GPU parity report for the same settings")
+
+
 def run(args):
     import torch
     import torch.distributed as dist
@@ -294,7 +408,8 @@ def run(args):
         optimizer, trainable = _make_optimizer(base, FULL_LEARNING_RATE)
         model = DistributedDataParallel(base, device_ids=[rank], broadcast_buffers=False,
                                         gradient_as_bucket_view=True) if world == 2 else base
-        scaler = torch.amp.GradScaler("cuda", init_scale=INITIAL_SCALE)
+        fp16 = args.precision == "fp16"
+        scaler = torch.amp.GradScaler("cuda", init_scale=INITIAL_SCALE, enabled=fp16)
         checksum, cases = select_tiny_cases(args.manifest)
         examples = {case.case_id: encode_example(
             tokenizer, render_prompt(case.task),
@@ -311,10 +426,10 @@ def run(args):
                     "adamw_weight_decay": optimizer.defaults["weight_decay"], "max_grad_norm": MAX_GRAD_NORM,
                     "initial_loss_scale": INITIAL_SCALE, "dropout": 0.0, "microbatch_size": 1,
                     "parity_global_batches": global_batches(ids, PARITY_UPDATES), "tolerances": TOLERANCES}
+        if not fp16:
+            settings.update(precision="FP32 weights and compute, no loss scaling", initial_loss_scale=1)
         if args.phase == "profile":
-            gate = _read(args.parity_report)
-            if gate["world_size"] != 2 or not gate["passed"] or gate["settings"] != settings:
-                raise ValueError("profile requires a passing two-GPU parity report for the same settings")
+            _require_profile_gate(_read(args.parity_report), settings)
         count = PARITY_UPDATES if args.phase == "parity" else WARMUP_UPDATES + TIMED_UPDATES
         batches = [_prepare_batches(order, examples, world)
                    for order in global_batches(ids, count)]
@@ -328,9 +443,10 @@ def run(args):
         if rank == 0:
             print(json.dumps({"event": "start", **metadata}), flush=True)
 
-        def update(step, hook=None):
+        def update(step, hook=None, trace=None):
             local = [encoded[key] for key in batches[step]["rank_case_ids"][rank]]
-            result = _train_update(model, optimizer, trainable, scaler, local, world, hook)
+            result = _train_update(model, optimizer, trainable, scaler, local, world, hook,
+                                   fp16=fp16, trace=trace)
             result["skipped_by_rank"] = _agree(result, world, device)
             return result
 
@@ -349,11 +465,17 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--reference-dir", type=Path)
     parser.add_argument("--parity-report", type=Path)
+    parser.add_argument("--trace-dir", type=Path, help=f"capture both updates for {TRACE_PARAMETER}")
+    parser.add_argument("--precision", choices=("fp16", "fp32"), default="fp16")
     args = parser.parse_args()
     if args.phase == "parity" and args.reference_dir is None:
         parser.error("parity requires --reference-dir")
     if args.phase == "profile" and args.parity_report is None:
         parser.error("profile requires --parity-report")
+    if args.phase == "profile" and args.trace_dir is not None:
+        parser.error("the parameter trace is only available in the parity phase")
+    if args.precision == "fp32" and (args.phase != "parity" or args.trace_dir is None):
+        parser.error("FP32 is only available as an opt-in parity diagnostic with --trace-dir")
     if not run(args):
         parser.exit(1, "Day 6 check failed; see the JSON report\n")
 

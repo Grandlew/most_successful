@@ -1,11 +1,70 @@
 import importlib.util
 import unittest
 
-from ddp_parity import TOLERANCES, _loss_report, _prepare_batches, _tensor_report, ddp_loss_weight, global_batches
+from ddp_parity import (
+    TRACE_SCALARS, TRACE_TENSORS, TOLERANCES, ParameterTrace, _compare_trace, _loss_report,
+    _prepare_batches, _require_profile_gate, _tensor_report, ddp_loss_weight, global_batches,
+)
 from train_sft import TrainingExample
 
 
 class BatchTests(unittest.TestCase):
+    def test_failed_or_unmatched_parity_report_blocks_profiling(self):
+        settings = {"precision": "fp16", "tolerances": TOLERANCES}
+        good = {"world_size": 2, "passed": True, "settings": settings}
+        _require_profile_gate(good, settings)
+        for invalid in ({**good, "passed": False}, {**good, "world_size": 1},
+                        {**good, "settings": {**settings, "precision": "fp32"}}):
+            with self.subTest(report=invalid), self.assertRaisesRegex(ValueError, "passing two-GPU parity"):
+                _require_profile_gate(invalid, settings)
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "parameter trace requires torch")
+    def test_trace_uses_previous_weight_for_update_delta_and_initial_for_cumulative(self):
+        import torch
+
+        weight = torch.nn.Parameter(torch.tensor([1.0, 3.0]))
+        initial = weight.detach().clone()
+        trace = ParameterTrace(weight, initial)
+        optimizer = torch.optim.AdamW([weight], lr=0.02)
+        after = []
+        for gradient in ([3.0, 4.0], [-4.0, 3.0]):
+            weight.grad = torch.tensor(gradient)
+            trace.pre_clip()
+            norm = torch.nn.utils.clip_grad_norm_([weight], 1.0)
+            trace.post_clip(norm, 1024)
+            optimizer.step()
+            trace.post_step(optimizer, 1024, False)
+            after.append(weight.detach().clone())
+
+        first, second = trace.steps
+        torch.testing.assert_close(first["gradient_pre_clip"], torch.tensor([3.0, 4.0]))
+        torch.testing.assert_close(first["gradient_post_clip"], torch.tensor([0.6, 0.8]))
+        self.assertAlmostEqual(first["global_pre_clip_norm"], 5.0)
+        self.assertAlmostEqual(first["clip_factor"], 0.2)
+        torch.testing.assert_close(first["exp_avg"], torch.tensor([0.06, 0.08]))
+        torch.testing.assert_close(first["exp_avg_sq"], torch.tensor([0.00036, 0.00064]))
+        torch.testing.assert_close(first["update_delta"], after[0] - initial)
+        torch.testing.assert_close(second["update_delta"], after[1] - after[0])
+        torch.testing.assert_close(second["cumulative_delta"], after[1] - initial)
+        self.assertFalse(torch.equal(second["update_delta"], second["cumulative_delta"]))
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "parameter comparison requires torch")
+    def test_trace_identifies_first_cumulative_tolerance_crossing(self):
+        import torch
+
+        def row(update, cumulative):
+            return {**{key: torch.tensor([0.0]) for key in TRACE_TENSORS},
+                    **{key: 1.0 for key in TRACE_SCALARS}, "skipped": False,
+                    "update_delta": torch.tensor([update]), "cumulative_delta": torch.tensor([cumulative])}
+
+        reference = [row(1e-5, 1e-5), row(1e-5, 2e-5)]
+        actual = [row(1.05e-5, 1.05e-5), row(1.25e-5, 2.3e-5)]
+        report = _compare_trace(actual, reference)
+        self.assertEqual(report["first_step_over_bound"], 2)
+        self.assertTrue(report["steps"][0]["cumulative_delta_vs_original_bound"]["passed"])
+        self.assertFalse(report["steps"][1]["cumulative_delta_vs_original_bound"]["passed"])
+        self.assertNotIn("passed", report["steps"][1]["tensors"]["update_delta"])
+
     def test_order_partition_and_token_counts_match_across_world_sizes(self):
         examples = {
             key: TrainingExample([17, *range(count)], [-100, *range(count)], 1)
